@@ -1,115 +1,249 @@
 # Flock Energy Meter API
 
-A read-only FastAPI service over the Urja Meter Ops portal. It converts authenticated legacy responses into documented JSON for meter search, meter details, consumption readings, and network exploration.
+A read-only FastAPI service over the Urja Meter Ops portal. It converts authenticated legacy responses into a documented API for meter discovery, meter details, consumption readings, transformer lookup, and network exploration.
 
-## Quick start (Windows PowerShell)
+The upstream portal is an undocumented application with separate search, transformer, signed-export, geography, and energy flows. This service hides those details behind validated Pydantic contracts, a normalized in-memory meter index, bounded retries, session renewal, and consistent JSON errors.
 
-Python 3.12+ is required. From the repository root:
+---
+
+## 1. What This Is and How It Is Structured
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    Urja Meter Ops Portal                    │
+│  • Form authentication with a session cookie                 │
+│  • Meter search and transformer pagination                    │
+│  • HMAC-signed bulk meter export                             │
+│  • Per-meter geography and consumption readings               │
+└─────────────────────────────────────────────────────────────┘
+                              ▲
+                              │ Authenticated HTTP requests
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 UrjaClient (`app/clients/`)                  │
+│  • Shared HTTPX client and session cookie jar                 │
+│  • Login coalescing and bounded authentication replay         │
+│  • Four-request concurrency limit                             │
+│  • Timeout and transient retry handling                       │
+│  • Signed export and complete pagination validation           │
+└─────────────────────────────────────────────────────────────┘
+             │                                      │
+             │ Snapshot / discovery                 │ Live consumption
+             ▼                                      ▼
+┌───────────────────────────────────┐   ┌───────────────────────────────┐
+│ MeterService (`app/services/`)    │   │ Reading normalization           │
+│ • In-memory export snapshot       │   │ • Decimal-safe numeric values   │
+│ • TTL and refresh coordination    │   │ • Explicit Asia/Kolkata         │
+│ • Search, filters, and pagination │   │   timestamp assumption          │
+│ • Nearby and overview queries     │   │ • Chronological cumulative      │
+│ • Hierarchy reconstruction        │   │   deltas with reset protection   │
+└───────────────────────────────────┘   └───────────────────────────────┘
+             │                                      │
+             └──────────────────┬───────────────────┘
+                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    FastAPI REST API                          │
+│  /health       /docs       /redoc       /openapi.json         │
+│  /api/v1/meters            /api/v1/meters/{meter_id}          │
+│  /api/v1/meters/nearby     /api/v1/meters/{id}/consumption    │
+│  /api/v1/transformers      /api/v1/network                   │
+│  /api/v1/overview          /api/v1/meta                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The request flow is:
+
+```text
+FastAPI route → MeterService → UrjaClient → Urja Meter Ops
+```
+
+Pure normalization and calculation logic stays in `backend/app/domain/`; API contracts stay in `backend/app/schemas/`. The service has no browser-runtime dependency and does not scrape HTML.
+
+---
+
+## 2. Quick Start
+
+### Prerequisites
+
+- Python 3.12+
+- A valid assignment login for the Urja Meter Ops portal
+- Docker Desktop, if using the container workflow
+
+### Installation and setup on Windows PowerShell
+
+From the repository root:
 
 ```powershell
 cd backend
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 Copy-Item .env.example .env
-# Fill PORTAL_USERNAME and PORTAL_PASSWORD in .env using the assignment's credentials.
+```
+
+Fill `PORTAL_USERNAME` and `PORTAL_PASSWORD` in `backend/.env`. The file is ignored by Git; credentials and signing secrets must never be committed.
+
+Start the development server:
+
+```powershell
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-If `.env` already exists, keep it. The local workspace has credentials configured from the supplied assignment; `.env` is ignored and is not a distributable file. No credentials or signing secrets belong in source control.
+Open:
 
-Linux/macOS: use `python3 -m venv .venv` and `.venv/bin/python` in place of the Windows interpreter path. You do not need to activate the environment.
+- [Swagger UI](http://127.0.0.1:8000/docs)
+- [ReDoc](http://127.0.0.1:8000/redoc)
+- [OpenAPI JSON](http://127.0.0.1:8000/openapi.json)
+- [Health check](http://127.0.0.1:8000/health)
 
-Open [Swagger UI](http://127.0.0.1:8000/docs), [ReDoc](http://127.0.0.1:8000/redoc), or [health](http://127.0.0.1:8000/health). The default server binds only to localhost. Authentication is lazy: health and docs work without portal credentials; data endpoints return a clear 503 until configured.
+Authentication is lazy. Health and documentation work without portal credentials. Data endpoints return a clear `503` until credentials are configured.
 
-## API
+Linux/macOS users can replace the Windows interpreter path with `.venv/bin/python`.
+
+### Docker
+
+Configure `backend/.env`, then run from the repository root:
+
+```powershell
+docker compose up --build
+```
+
+The API is exposed at `http://127.0.0.1:8000`.
+
+---
+
+## 3. API Surface
 
 | Method | Path | Behavior |
 | --- | --- | --- |
-| GET | `/health` | Process liveness, no upstream probe |
-| GET | `/api/v1/meters` | Search meter ID/serial; make/status/transformer/phase/installation/hierarchy filters; sorting and pagination |
-| GET | `/api/v1/meters/nearby` | Radius search ordered by distance, with pre-limit match count |
-| GET | `/api/v1/overview` | Fleet counts by make/status/phase and data completeness |
-| GET | `/api/v1/meta` | Passive cache state, age, TTL, and refresh status |
-| GET | `/api/v1/meters/{meter_id}` | Normalized details, coordinates, hierarchy, data-quality warnings |
-| GET | `/api/v1/meters/{meter_id}/consumption` | Cumulative readings and safe deltas; bounded historical retrieval with start/end |
-| GET | `/api/v1/transformers` | Complete transformer directory using upstream pagination metadata |
+| GET | `/health` | Process liveness; does not contact the portal |
+| GET | `/api/v1/meters` | Search, filter, sort, and paginate the meter snapshot |
+| GET | `/api/v1/meters/nearby` | Find meters within a radius, ordered by distance |
+| GET | `/api/v1/overview` | Fleet counts and source-data completeness |
+| GET | `/api/v1/meta` | Snapshot state, age, TTL, and refresh status |
+| GET | `/api/v1/meters/{meter_id}` | Normalized meter details and quality warnings |
+| GET | `/api/v1/meters/{meter_id}/consumption` | Cumulative readings and safe consumption deltas |
+| GET | `/api/v1/transformers` | Complete transformer directory |
 | GET | `/api/v1/transformers/{transformer_code}` | Transformer details |
-| GET | `/api/v1/network` | Flat hierarchy with explicit parents, meter counts, conflict warnings |
-| GET | `/api/v1/network/node?node_id=...` | One hierarchy node, using its returned ID |
+| GET | `/api/v1/network` | Flat hierarchy with parent links and warnings |
+| GET | `/api/v1/network/node?node_id=...` | One hierarchy node by its returned ID |
+
+All errors use the same envelope:
+
+```json
+{
+  "error": {
+    "code": "not_found",
+    "message": "Meter not found."
+  }
+}
+```
+
+Validation errors return `422`, missing resources return `404`, malformed upstream data returns `502`, unavailable or authentication failures return `503`, and upstream timeouts return `504`.
+
+---
+
+## 4. Sample Requests
+
+The following examples use PowerShell:
 
 ```powershell
 Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/meters?q=J100000&page=1&page_size=20'
 Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/meters/J100000'
-Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/meters/J100000/consumption?start=2026-06-24T00:00:00Z&end=2026-06-25T00:00:00Z'
-Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/network'
 Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/meters/nearby?latitude=26.938&longitude=75.830&radius_km=2&limit=10'
+Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/transformers'
+Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/network'
 Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/overview'
 Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/meta'
-Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/meters?phase=single&hierarchy_level=zone&hierarchy_code=Z-01&sort_by=make&order=asc'
 ```
 
-Observed J100000 fields include serial `SE33962`, make `HPL`, phase `single`, status `Decommissioned`, and transformer `DT-001`. A normalized reading looks like:
+Consumption requests require dates with an offset. In a query string, encode `+` as `%2B`, or use `Z`:
+
+```powershell
+Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/meters/J100000/consumption?start=2026-06-24T00:00:00Z&end=2026-06-25T00:00:00Z'
+```
+
+A normalized reading preserves decimal values as strings:
 
 ```json
-{"timestamp":"2026-06-23T23:30:00+05:30","kwh":"48438.74","kvah":"52313.84","voltage_r":"226"}
+{
+  "timestamp": "2026-06-23T23:30:00+05:30",
+  "kwh": "48438.74",
+  "kvah": "52313.84",
+  "voltage_r": "226",
+  "consumption_kwh": null
+}
 ```
 
-Decimal readings serialize as strings to retain decimal precision. Zero is preserved. Missing or invalid numeric values become null with warnings. Invalid timestamps are omitted with warnings. The timestamp timezone is an explicit assumption, not a verified upstream guarantee.
+The portal appears to expose cumulative registers. `consumption_kwh` is calculated only between valid, chronologically ordered readings. The first reading, missing registers, duplicate timestamps, and register decreases produce a null delta rather than fabricated usage.
 
-Dates must include an offset; URL-encode `+` as `%2B` in query strings, or use `Z`. Supply both `start` and `end` to fetch historical readings using the verified upstream `from`/`to` calendar-date parameters. UTC boundaries are converted to Asia/Kolkata dates before fetching, then exact inclusive timestamps are applied locally. Queries span at most 93 local calendar days. With neither bound, the default upstream window is returned; one bound retains local filtering of that default window. Data availability is determined by the portal. kWh/kVAh values appear cumulative; the original cumulative values remain available. `consumption_kwh` reports the Decimal difference between successive valid, chronologically sorted readings in the returned slice. The first row, missing registers, intervals touching duplicate timestamps, and register decreases produce null deltas rather than fabricated usage. A delta spans the actual time between its two readings, which may exceed a normal interval.
+---
 
-Errors use `{"error":{"code":"...","message":"..."}}`. Invalid parameters return 422, missing meters/nodes 404, malformed upstream responses 502, unavailable/authentication failures 503, and upstream timeouts 504.
+## 5. Configuration and Freshness
 
-## Structure and architecture
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORTAL_URL` | Assignment portal URL | Upstream base URL |
+| `PORTAL_USERNAME` | Empty | Portal login email |
+| `PORTAL_PASSWORD` | Empty | Portal password; local environment only |
+| `REQUEST_TIMEOUT` | `15` | Per-request timeout in seconds |
+| `EXPORT_TTL_SECONDS` | `60` | In-memory export cache lifetime; `0` disables reuse |
+| `UPSTREAM_ATTEMPTS` | `3` | Maximum transient attempts plus one auth replay budget |
 
-The layout preserves MedSync's separate application roots and adapts the reference repository's routes/domain/portal separation to FastAPI. See the [complete folder guide](docs/architecture.md) and [engineering decision log](docs/decisions.md).
+The export is held as a small in-memory snapshot. A lock prevents duplicate refreshes, and `/api/v1/meta` reports whether it is `not_loaded`, `fresh`, or `expired`. Stale data is not silently served after a failed refresh. Consumption is fetched fresh for each request.
+
+Each worker owns its own cache; there is no background synchronization or database requirement. PostgreSQL, SQLAlchemy, and Alembic are intentionally deferred because the verified workflows do not require durable storage.
+
+---
+
+## 6. Reliability and Data Rules
+
+- Upstream requests share one HTTPX connection pool and session cookie jar for the application lifetime.
+- Concurrent logins are coalesced, and an expired session receives one bounded renewal/replay.
+- Four data requests may run concurrently. The request slot is released before session renewal to avoid semaphore deadlocks.
+- Only read requests receive transient retries. Retryable conditions include network/timeouts and `429`, `502`, `503`, and `504`.
+- Transformer ingestion follows upstream pagination metadata and rejects incomplete, duplicated, malformed, or inconsistent pages.
+- Export ingestion requires the returned row count to match `total` and rejects duplicate or blank meter IDs.
+- Nearby search uses Haversine distance on valid coordinates and reports the full match count before limiting results.
+- Hierarchy IDs include ancestry because observed hierarchy codes are not globally unique.
+- Missing or invalid numeric values become `null` with warnings; zero remains a valid value.
+- Portal timestamps do not include a timezone. The API documents Asia/Kolkata as an assumption based on the Jaipur utility context.
+- Historical consumption requests are capped at 93 local calendar days and require paired `start`/`end` bounds for upstream retrieval.
+
+See the [verified protocol](PROTOCOL.md) for observed upstream behavior and limitations.
+
+---
+
+## 7. Project Structure
 
 ```text
 backend/
   app/
-    main.py             Application lifecycle, errors, request logging
-    api/                Central router, dependencies, routes grouped by resource
-    clients/            Upstream authentication, signing, retries, pagination
-    core/               Configuration and shared errors
-    domain/             Pure normalization, reading, hierarchy, and discovery logic
-    schemas/            Pydantic contracts grouped by resource
-    services/           Snapshot freshness, upstream orchestration, application queries
-  scripts/              OpenAPI export and explicit live API smoke check
+    main.py             Application lifecycle, errors, and request logging
+    api/                Router, dependencies, and versioned endpoints
+    clients/            Upstream authentication, signing, retries, and pagination
+    core/               Configuration and shared exceptions
+    domain/             Pure normalization, readings, hierarchy, and discovery logic
+    schemas/            Pydantic response and request contracts
+    services/           Snapshot freshness and application orchestration
+  scripts/              OpenAPI export and explicit live smoke check
   tests/
-    unit/               Client behavior and pure calculation tests
+    unit/               Client, geography, and pure calculation tests
     integration/        HTTP API tests with mocked upstream responses
 frontend/               Optional dashboard scope note
 docs/
-  decisions.md          Decisions, alternatives, trade-offs, revisit conditions
   architecture.md       Folder responsibilities and dependency rules
+  decisions.md          Engineering decisions and trade-offs
   investigation/        Sanitized protocol evidence
-PROTOCOL.md             Verified upstream protocol
-REFLECTION.md           Technical notes and personal reflection prompts
-openapi.json            Generated OpenAPI 3.x contract
+PROTOCOL.md              Verified upstream protocol
+REFLECTION.md            Technical notes and reflection prompts
+openapi.json             Generated OpenAPI 3.1 contract
 ```
 
-Request flow: FastAPI router -> service -> HTTPX portal client -> Urja Meter Ops. The service reads the portal's existing signed bulk export, which already contains nameplate, geographic, and hierarchy fields. Consumption remains a per-meter request. There is no browser runtime dependency or HTML scraping in the service.
+Read the [folder guide](docs/architecture.md) for dependency boundaries and the [decision log](docs/decisions.md) for alternatives and trade-offs.
 
-Four upstream data requests may run concurrently. A request releases its concurrency slot before any session renewal or retry, preventing recursive semaphore deadlocks. Authentication replay has a separate budget from transient failures. One HTTPX connection pool and session cookie jar live for the application lifetime and are closed on shutdown. A lock coalesces concurrent logins. An expired session triggers one renewal, with bounded replay. A 401 or login redirect can trigger session renewal; a 403 is reported as an upstream access error without repeating login. Only read requests receive transient retries; form login is not automatically retried. Retryable conditions are network/timeout failures and 429/502/503/504. Backoff is bounded; unexpected response bodies and errors are not logged.
+---
 
-## Configuration and freshness
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `PORTAL_URL` | Supplied portal URL | Upstream base URL |
-| `PORTAL_USERNAME` | empty | Assignment login email |
-| `PORTAL_PASSWORD` | empty | Secret, local environment only |
-| `REQUEST_TIMEOUT` | 15 | Per-request HTTP timeout in seconds |
-| `EXPORT_TTL_SECONDS` | 60 | Per-process export cache lifetime, 0 disables reuse |
-| `UPSTREAM_ATTEMPTS` | 3 | Maximum transient attempts, with one additional auth replay budget |
-
-The export cache is a small, in-memory snapshot with a lock to prevent duplicate fetches. `fetched_at` exposes retrieval time. Expired snapshots are refreshed; stale data is never silently served after refresh failure. Consumption is fetched fresh. Each worker has its own cache; there is no background synchronization. Refresh fetches the whole export, so a very large dataset or many workers would need a shared index and a streaming or paginated ingestion design.
-
-## PostgreSQL decision
-
-Direct reads plus a short-lived cache satisfy the core task. PostgreSQL, SQLAlchemy models, and Alembic migrations are intentionally deferred: no durable table is necessary for the verified workflows. Database and migration packages will be created with the first justified persistent feature; unused scaffolding has been removed. A future index should upsert observed meter IDs and record retrieval time, while retaining the portal as the source of truth. There are no database setup requirements for this version.
-
-## Test and verify
+## 8. Test and Verify
 
 Run from `backend/`:
 
@@ -118,52 +252,32 @@ Run from `backend/`:
 .\.venv\Scripts\python.exe -m ruff check app tests scripts
 .\.venv\Scripts\python.exe -m ruff format --check app tests scripts
 .\.venv\Scripts\python.exe -m scripts.export_openapi
-# Explicitly opts into read-only live portal traffic:
+```
+
+The test suite uses mocked upstream traffic and does not require credentials, network access, or a database. The live smoke script is intentionally separate because it contacts the portal:
+
+```powershell
 .\.venv\Scripts\python.exe -m scripts.smoke
 ```
 
-The offline suite contains 75 passing tests, including four simultaneous expired requests, changing/incomplete transformer pages, incomplete exports, and invalid/reset register values. The normal test suite uses mocked upstream responses and requires neither credentials, network access, nor a database. Tests cover signatures, concurrent login, session renewal, retries, timeouts, malformed responses, normalization, exact filter behavior, pagination, timestamps, and hierarchy conflicts.
-
-A live check on 29 October 2026 verified 403 meters, 40 transformers across all upstream pages, 337 readings for J100000, and 240 hierarchy nodes with 91 conflict warnings. Counts are observations of that instance, not invariants. See [investigation evidence](docs/investigation/EVIDENCE.md).
-
-## Docker
+To check an already-running server:
 
 ```powershell
-docker compose up --build
+.\.venv\Scripts\python.exe -m scripts.smoke --base-url http://127.0.0.1:8000
 ```
 
-First configure `backend/.env`. Docker exposes port 8000 on localhost. The image build and all 11 API paths have been verified in a temporary Docker container, as well as in the local Python environment.
+---
 
-## Decisions, assumptions, and limitations
+## 9. Documentation and Scope
 
-The numbered [decision log](docs/decisions.md) records the chosen approach, alternatives, trade-offs, and conditions for revisiting each architecture choice.
+- [Backend README](backend/README.md)
+- [Architecture guide](docs/architecture.md)
+- [Engineering decisions](docs/decisions.md)
+- [Verified protocol](PROTOCOL.md)
+- [Investigation evidence](docs/investigation/EVIDENCE.md)
+- [OpenAPI contract](openapi.json)
+- [Reflection prompts](REFLECTION.md)
 
-- The signed bulk route is a normal feature of the portal's transformer page. It avoids per-meter detail scraping and preserves fields that search omits.
-- The observed export returns all 403 rows for `page=1` without pagination metadata. The service checks row count against `total` and fails clearly if the portal starts returning partial exports.
-- Hierarchy codes are not globally unique in clean parent relationships. IDs include full ancestry, preventing silent merges; warnings expose reused codes under different parents and conflicting labels.
-- Portal timestamps omit timezone. Asia/Kolkata is assumed based on the Jaipur utility context. Historical `from`/`to` support was verified with June 1-2 and June 25 queries; the public API caps requests at 93 local days.
-- Search is local case-insensitive ID/serial matching; make/status/transformer filters use exact values. Sorting defaults to meter ID ascending. `sort_by` supports meter_id/make/status and `order` supports asc/desc; meter ID breaks ties. Hierarchy filters require both hierarchy_level and hierarchy_code and match exact observed codes.
-- No JWT, user accounts, mutations, Redis, background workers, or frontend dashboard are required for the core task. The API is intended for trusted local use. Add access controls before exposing it outside that context.
-- The adapter depends on an undocumented protocol and on the bulk signing secret route. Credentials and signing secrets remain runtime-only. Changes to those routes require adapter updates.
-- Retry-After scheduling, shared multi-worker cache, production metrics, persistent query indexing, and large-export streaming are improvements for a larger deployment.
-- Personal reflection must be completed by the candidate from their own experience. Technical investigation and code here were assistant-assisted; do not represent them as independently completed work.
+The core submission is backend-focused. There are no user accounts, mutations, JWTs, Redis, background workers, persistent query indexing, or dashboard requirements in the current scope. Add access controls before exposing the service beyond a trusted local environment.
 
-[Engineering decisions](docs/decisions.md) · [Folder guide](docs/architecture.md) · [Verified protocol](PROTOCOL.md) · [OpenAPI contract](openapi.json) · [Reflection](REFLECTION.md)
-
-
-## Repository review fixes
-
-The referenced TypeScript/Fastify repository was reviewed for behavior; this implementation remains Python 3.12+, FastAPI, Pydantic v2, HTTPX, and pytest. No Node application was added. Transformer pagination follows observed `total`, `page`, and `pageSize`; duplicate codes, missing pages, changed totals or page sizes, and malformed records fail with 502. Export ingestion validates completeness and unique, nonblank meter IDs before replacing the current cache. Consumption normalization never treats invalid data as zero or invents a negative consumption interval after register reset.
-
-
-## Discovery and freshness
-
-Nearby search uses Haversine distance on valid export coordinates. It sorts by unrounded distance and meter ID, limits results to 100, and reports the full matching count before the limit. Missing or invalid coordinates are excluded and counted; legitimate (0, 0) coordinates remain valid. This is an O(N) scan suited to the observed small dataset.
-
-The overview returns meter counts by observed status, make, and phase, distinct nonempty transformer codes, coordinate coverage, meters with normalization warnings, and incomplete hierarchy counts. It reports source-data completeness, not electrical fault detection. Missing grouping values use `Unknown`.
-
-`/api/v1/meta` is passive and requires no upstream connection. Its state is `not_loaded`, `fresh`, or `expired`, with snapshot age, TTL, and refresh-in-progress. An expired cache is not silently served by data endpoints: the next data query refreshes it or returns the upstream error. All discovery responses that use a snapshot include `fetched_at`.
-
-The smoke script exercises all public API routes plus representative validation and error paths against live portal data. To check an already-running instance instead of an in-process app, run `python -m scripts.smoke --base-url http://127.0.0.1:8001` from backend. Both the local server and the Docker container passed this live smoke check.
-#   F l o c k - E n e r g y - S o f t w a r e - A s s i g n m e n t  
- 
+The upstream adapter depends on undocumented portal behavior, including the signed bulk export route. Credentials and signing secrets remain runtime-only, and protocol changes may require corresponding client updates.
